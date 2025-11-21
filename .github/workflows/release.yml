@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      
+      - name: Build
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o mc-ws-proxy-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -o mc-ws-proxy-linux-arm64 .
+          GOOS=windows GOARCH=amd64 go build -o mc-ws-proxy-windows-amd64.exe .
+          GOOS=darwin GOARCH=amd64 go build -o mc-ws-proxy-darwin-amd64 .
+          GOOS=darwin GOARCH=arm64 go build -o mc-ws-proxy-darwin-arm64 .
+      
+      - uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: mc-ws-proxy-*
+      
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/heads/')
+        with:
+          name: mc-ws-proxy-builds
+          path: mc-ws-proxy-*
