@@ -1,26 +1,17 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 var (
-	mode             = flag.String("mode", "entry", "mode: entry | exit")
-	debug            = flag.Bool("debug", false, "enable debug logging like wsmc")
-	dumpBytes        = flag.Bool("dump-bytes", false, "dump hex for each proxied frame (implies -debug)")
-	maxFramePayload  = flag.Int64("max-frame-payload", 65536, "maximum WebSocket payload length (similar to wsmc.maxFramePayloadLength)")
-	pingInterval     = flag.Duration("ping-interval", 25*time.Second, "WebSocket ping interval to keep connections alive through CDN")
+	mode = flag.String("mode", "entry", "mode: entry | exit")
 
 	// 入口机参数（玩家 <-> WebSocket）
 	entryListenAddr  = flag.String("listen", ":25565", "TCP listen address for players, e.g. :25565")
@@ -29,13 +20,6 @@ var (
 	// 出口机参数（WebSocket <-> 本地MC）
 	exitListenAddr = flag.String("exit-listen", ":8080", "WebSocket listen address on exit server, e.g. :8080")
 	exitTargetAddr = flag.String("exit-target", "127.0.0.1:25565", "TCP target address (Minecraft server), e.g. 127.0.0.1:25565")
-)
-
-const (
-	tcpReadTimeout  = 120 * time.Second
-	tcpWriteTimeout = 30 * time.Second
-	wsReadTimeout   = 60 * time.Second
-	closeWait       = 2 * time.Second
 )
 
 var upgrader = websocket.Upgrader{
@@ -98,7 +82,16 @@ func handleEntryConn(tcpConn net.Conn) {
 	log.Println("[ENTRY] Connected to WS backend", *entryWsServerURL)
 	defer ws.Close()
 
-	bridgeTCPAndWS(tcpConn, ws, "[ENTRY]")
+	ws.SetReadLimit(1 << 20) // 1MB
+	ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+	ws.SetPongHandler(func(string) error {
+		ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// 启动双向转发：TCP->WS 和 WS->TCP
+	go copyTCPToWS(tcpConn, ws, "[ENTRY]")
+	copyWSToTCP(ws, tcpConn, "[ENTRY]")
 
 	log.Println("[ENTRY] Connection closed for player", tcpConn.RemoteAddr())
 }
@@ -138,174 +131,63 @@ func handleExitWS(w http.ResponseWriter, r *http.Request) {
 		c.SetNoDelay(true)
 	}
 
-	bridgeTCPAndWS(tcpConn, ws, "[EXIT]")
+	ws.SetReadLimit(1 << 20)
+	ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+	ws.SetPongHandler(func(string) error {
+		ws.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// 启动双向转发：WS->TCP 和 TCP->WS
+	go copyWSToTCP(ws, tcpConn, "[EXIT]")
+	copyTCPToWS(tcpConn, ws, "[EXIT]")
 
 	log.Println("[EXIT] WS connection closed from", r.RemoteAddr)
 }
 
 ///////////////////////
-//  通用复制函数（参考 wsmc WebSocketHandler）
+//  通用复制函数
 ///////////////////////
 
-func bridgeTCPAndWS(tcpConn net.Conn, ws *websocket.Conn, tag string) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ws.SetReadLimit(*maxFramePayload)
-	ws.SetReadDeadline(time.Now().Add(wsReadTimeout))
-	ws.SetPongHandler(func(string) error {
-		ws.SetReadDeadline(time.Now().Add(wsReadTimeout))
-		return nil
-	})
-
-	errCh := make(chan error, 3)
-	var wg sync.WaitGroup
-	var wsWriteMu sync.Mutex
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		errCh <- copyTCPToWS(ctx, tcpConn, ws, &wsWriteMu, tag)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		errCh <- copyWSToTCP(ctx, ws, tcpConn, tag)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		errCh <- wsPingLoop(ctx, ws, &wsWriteMu, tag)
-	}()
-
-	firstErr := <-errCh
-	cancel()
-
-	_ = tcpConn.SetDeadline(time.Now())
-	_ = ws.SetReadDeadline(time.Now())
-
-	wsWriteMu.Lock()
-	_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(closeWait))
-	wsWriteMu.Unlock()
-
-	_ = ws.Close()
-	_ = tcpConn.Close()
-
-	wg.Wait()
-
-	if firstErr != nil && !errors.Is(firstErr, context.Canceled) && !errors.Is(firstErr, io.EOF) {
-		log.Println(tag, "bridge closed:", firstErr)
-	}
-}
-
-func copyTCPToWS(ctx context.Context, tcp net.Conn, ws *websocket.Conn, wsMu *sync.Mutex, tag string) error {
-	buf := make([]byte, 8192)
+func copyTCPToWS(tcp net.Conn, ws *websocket.Conn, tag string) {
+	buf := make([]byte, 4096)
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		_ = tcp.SetReadDeadline(time.Now().Add(tcpReadTimeout))
+		// 读玩家或MC服务器的TCP数据
+		_ = tcp.SetReadDeadline(time.Now().Add(120 * time.Second))
 		n, err := tcp.Read(buf)
 		if err != nil {
-			return fmt.Errorf("%s TCP read: %w", tag, err)
+			log.Println(tag, "TCP read error:", err)
+			return
 		}
 		if n <= 0 {
 			continue
 		}
 
-		slice := buf[:n]
-		if *debug || *dumpBytes {
-			log.Printf("%s TCP->WS (%d)", tag, n)
-		}
-		if *dumpBytes {
-			dumpHex(slice)
-		}
-
-		wsMu.Lock()
-		_ = ws.SetWriteDeadline(time.Now().Add(tcpWriteTimeout))
-		err = ws.WriteMessage(websocket.BinaryMessage, slice)
-		wsMu.Unlock()
-		if err != nil {
-			return fmt.Errorf("%s WS write: %w", tag, err)
+		// 写入到 WebSocket（二进制帧）
+		_ = ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+			log.Println(tag, "WS write error:", err)
+			return
 		}
 	}
 }
 
-func copyWSToTCP(ctx context.Context, ws *websocket.Conn, tcp net.Conn, tag string) error {
+func copyWSToTCP(ws *websocket.Conn, tcp net.Conn, tag string) {
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
 		msgType, data, err := ws.ReadMessage()
 		if err != nil {
-			return fmt.Errorf("%s WS read: %w", tag, err)
+			log.Println(tag, "WS read error:", err)
+			return
 		}
-
-		switch msgType {
-		case websocket.BinaryMessage:
-			if *debug || *dumpBytes {
-				log.Printf("%s WS->TCP (%d)", tag, len(data))
-			}
-			if *dumpBytes {
-				dumpHex(data)
-			}
-
-			_ = tcp.SetWriteDeadline(time.Now().Add(tcpWriteTimeout))
-			if _, err := tcp.Write(data); err != nil {
-				return fmt.Errorf("%s TCP write: %w", tag, err)
-			}
-		case websocket.CloseMessage:
-			return io.EOF
-		case websocket.TextMessage:
-			// ignore text frames as in wsmc
+		if msgType != websocket.BinaryMessage {
+			// 忽略文本帧等
 			continue
-		default:
-			if *debug {
-				log.Printf("%s unsupported WS frame type: %d", tag, msgType)
-			}
 		}
-	}
-}
 
-func wsPingLoop(ctx context.Context, ws *websocket.Conn, wsMu *sync.Mutex, tag string) error {
-	ticker := time.NewTicker(*pingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			wsMu.Lock()
-			err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(tcpWriteTimeout))
-			wsMu.Unlock()
-			if err != nil {
-				return fmt.Errorf("%s WS ping: %w", tag, err)
-			}
+		_ = tcp.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		if _, err := tcp.Write(data); err != nil {
+			log.Println(tag, "TCP write error:", err)
+			return
 		}
-	}
-}
-
-func dumpHex(data []byte) {
-	const maxPerLine = 32
-	for i := 0; i < len(data); i += maxPerLine {
-		end := i + maxPerLine
-		if end > len(data) {
-			end = len(data)
-		}
-		line := data[i:end]
-		out := make([]byte, 0, len(line)*3)
-		for _, b := range line {
-			out = append(out, fmt.Sprintf("%02X ", b)...)
-		}
-		log.Printf("%s", string(out))
 	}
 }
