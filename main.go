@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,6 +26,7 @@ var (
 	// 入口机参数（玩家 <-> WebSocket）
 	entryListenAddr  = flag.String("listen", ":25565", "TCP listen address for players, e.g. :25565")
 	entryWsServerURL = flag.String("ws", "wss://mc.example.com/ws", "WebSocket server URL (Cloudflare hostname), e.g. wss://mc.example.com/ws")
+	entrySkipTLS     = flag.Bool("skip-tls-verify", true, "skip TLS certificate verification when dialing entry WebSocket (insecure)")
 
 	// 出口机参数（WebSocket <-> 本地MC）
 	exitListenAddr = flag.String("exit-listen", ":8080", "WebSocket listen address on exit server, e.g. :8080")
@@ -88,6 +90,9 @@ func handleEntryConn(tcpConn net.Conn) {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: *entrySkipTLS,
+		},
 	}
 
 	ws, _, err := dialer.Dial(*entryWsServerURL, nil)
