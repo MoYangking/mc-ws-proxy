@@ -15,4 +15,7 @@ COPY --from=builder /mc-ws-proxy ./mc-ws-proxy
 
 EXPOSE 25565
 
-CMD ["./mc-ws-proxy", "-mode", "entry", "-listen", ":25565", "-ws", "wss://mc.moyang.locker/ws"]
+ENV ENTRY_LISTEN_ADDR=":25565"
+ENV ENTRY_WS_URL="wss://mc.moyang.locker/ws"
+
+CMD ["./mc-ws-proxy", "-mode", "entry"]

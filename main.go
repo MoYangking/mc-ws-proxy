@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -24,14 +25,21 @@ var (
 	pingInterval     = flag.Duration("ping-interval", 25*time.Second, "WebSocket ping interval to keep connections alive through CDN")
 
 	// 入口机参数（玩家 <-> WebSocket）
-	entryListenAddr  = flag.String("listen", ":25565", "TCP listen address for players, e.g. :25565")
-	entryWsServerURL = flag.String("ws", "wss://mc.example.com/ws", "WebSocket server URL (Cloudflare hostname), e.g. wss://mc.example.com/ws")
+	entryListenAddr  = flag.String("listen", envOrDefault("ENTRY_LISTEN_ADDR", ":25565"), "TCP listen address for players, e.g. :25565")
+	entryWsServerURL = flag.String("ws", envOrDefault("ENTRY_WS_URL", "wss://mc.example.com/ws"), "WebSocket server URL (Cloudflare hostname), e.g. wss://mc.example.com/ws")
 	entrySkipTLS     = flag.Bool("skip-tls-verify", true, "skip TLS certificate verification when dialing entry WebSocket (insecure)")
 
 	// 出口机参数（WebSocket <-> 本地MC）
-	exitListenAddr = flag.String("exit-listen", ":8080", "WebSocket listen address on exit server, e.g. :8080")
-	exitTargetAddr = flag.String("exit-target", "127.0.0.1:25565", "TCP target address (Minecraft server), e.g. 127.0.0.1:25565")
+	exitListenAddr = flag.String("exit-listen", envOrDefault("EXIT_LISTEN_ADDR", ":8080"), "WebSocket listen address on exit server, e.g. :8080")
+	exitTargetAddr = flag.String("exit-target", envOrDefault("EXIT_TARGET_ADDR", "127.0.0.1:25565"), "TCP target address (Minecraft server), e.g. 127.0.0.1:25565")
 )
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 const (
 	tcpReadTimeout  = 120 * time.Second
